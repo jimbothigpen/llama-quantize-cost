@@ -192,8 +192,11 @@ static void usage(const char * argv0) {
     fprintf(stderr,
         "Usage: %s --model SRC.gguf --types T1,T2,... --output costs.csv\n"
         "       [--imatrix IMATRIX.dat] [--include-regex REGEX] [--exclude-regex REGEX]\n"
+        "       [--fisher-sidecar DIR]\n"
         "\n"
-        "Writes one row per (tensor, type) measuring round-trip MSE and quantized size.\n",
+        "Writes one row per (tensor, type) measuring round-trip MSE and quantized size.\n"
+        "With --fisher-sidecar, additionally computes Fisher row-weighted output MSE\n"
+        "from per-Linear .bin sidecars produced by prismaquant-llama's emitter.\n",
         argv0);
 }
 
@@ -203,6 +206,118 @@ static bool read_tensor_bytes(FILE * fp, size_t off, size_t nbytes, void * dst) 
     return fread(dst, 1, nbytes, fp) == nbytes;
 }
 
+// Fisher sidecar reader. Each sidecar file is a per-Linear binary blob
+// produced by prismaquant-llama's scripts/emit_fisher_sidecar.py, layout:
+//
+//   offset  size                       field
+//   0       4 bytes                    magic = "PQFS"
+//   4       4 bytes (uint32 LE)        version = 1
+//   8       4 bytes (uint32 LE)        N (sampled activation rows)
+//   12      4 bytes (uint32 LE)        in_features
+//   16      N * in_features * 4 bytes  X (float32, row-major [N, in_features])
+//   ...     N * 4 bytes                fisher_weights (float32 per row)
+//
+// File naming: GGUF tensor name with `.` -> `__`, suffixed `.bin`.
+// Example: `blk.0.attn_q.weight` -> `<dir>/blk__0__attn_q__weight.bin`.
+//
+// Loaded lazily; absent sidecars produce NaN fisher_output_mse rather than
+// aborting (keeps the binary useful when no fisher pass was requested).
+
+struct fisher_sidecar {
+    uint32_t n_rows         = 0;
+    uint32_t in_features    = 0;
+    std::vector<float> X;
+    std::vector<float> fisher_weights;
+};
+
+static std::string sidecar_safe_name(const std::string & gguf_tensor_name) {
+    std::string out;
+    out.reserve(gguf_tensor_name.size() + 8);
+    for (char c : gguf_tensor_name) {
+        if (c == '.') { out += "__"; } else { out += c; }
+    }
+    return out;
+}
+
+static bool load_fisher_sidecar(const std::string & dir,
+                                const std::string & tensor_name,
+                                fisher_sidecar & sc,
+                                std::string & err) {
+    const std::string path = dir + "/" + sidecar_safe_name(tensor_name) + ".bin";
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        err = "open failed: " + path;
+        return false;
+    }
+    char magic[4];
+    uint32_t version = 0;
+    uint32_t n_rows = 0, in_features = 0;
+    if (fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "PQFS", 4) != 0) {
+        err = "bad magic: " + path; fclose(f); return false;
+    }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version != 1u) {
+        err = "bad version: " + path; fclose(f); return false;
+    }
+    if (fread(&n_rows, sizeof(n_rows), 1, f) != 1 ||
+        fread(&in_features, sizeof(in_features), 1, f) != 1) {
+        err = "header truncated: " + path; fclose(f); return false;
+    }
+    if (n_rows == 0 || in_features == 0) {
+        err = "zero rows/features: " + path; fclose(f); return false;
+    }
+    sc.n_rows      = n_rows;
+    sc.in_features = in_features;
+    sc.X.assign((size_t)n_rows * (size_t)in_features, 0.0f);
+    sc.fisher_weights.assign((size_t)n_rows, 0.0f);
+    if (fread(sc.X.data(), sizeof(float), sc.X.size(), f) != sc.X.size()) {
+        err = "X truncated: " + path; fclose(f); return false;
+    }
+    if (fread(sc.fisher_weights.data(), sizeof(float),
+              sc.fisher_weights.size(), f) != sc.fisher_weights.size()) {
+        err = "fisher_weights truncated: " + path; fclose(f); return false;
+    }
+    fclose(f);
+    return true;
+}
+
+// Compute Fisher row-weighted output MSE for a single (tensor, format).
+//
+// Inputs:
+//   src_f32    : original weights, shape [n_out, n_in] row-major
+//   deq_f32    : quant-then-dequant weights, same shape
+//   X          : activation samples, shape [N, n_in] row-major
+//   fisher     : per-row Fisher weights, length N
+//   n_out, n_in, N : dimensions
+//
+// Math (mirrors prismaquant/measure_quant_cost.py:404-410):
+//   y_err[i,j] = sum_k X[i,k] * (src_f32[j,k] - deq_f32[j,k])
+//   fisher_output_mse = sum_{i,j} fisher[i] * y_err[i,j]^2 / (N * n_out)
+//
+// Cost: O(N * n_out * n_in) per call. Caller is expected to invoke this
+// only for direct-measure tensors (~20 per pipeline), not after-propagation.
+static double compute_fisher_output_mse(
+        const float * src_f32, const float * deq_f32,
+        const float * X, const float * fisher,
+        int64_t n_out, int64_t n_in, int64_t N) {
+    // Output error per (row i, output feature j): y_err[i, j].
+    // Computed inline to avoid materializing the full [N, n_out] matrix.
+    double weighted_sse = 0.0;
+    for (int64_t j = 0; j < n_out; ++j) {
+        // err_w[j, :] = src_f32[j, :] - deq_f32[j, :]
+        const float * sj = src_f32 + j * n_in;
+        const float * dj = deq_f32 + j * n_in;
+        for (int64_t i = 0; i < N; ++i) {
+            const float * xi = X + i * n_in;
+            double acc = 0.0;
+            for (int64_t k = 0; k < n_in; ++k) {
+                acc += (double)xi[k] * (double)(sj[k] - dj[k]);
+            }
+            weighted_sse += (double)fisher[i] * acc * acc;
+        }
+    }
+    return weighted_sse / ((double)N * (double)n_out);
+}
+
 int main(int argc, char ** argv) {
     std::string fname_in;
     std::string types_csv;
@@ -210,6 +325,7 @@ int main(int argc, char ** argv) {
     std::string fname_imatrix;  // optional
     std::string include_re;
     std::string exclude_re;
+    std::string fisher_sidecar_dir;  // optional; activates fisher_output_mse column
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -217,12 +333,13 @@ int main(int argc, char ** argv) {
             if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", tag); exit(1); }
             return std::string(argv[++i]);
         };
-        if      (a == "--model")          fname_in     = need("--model");
-        else if (a == "--types")          types_csv    = need("--types");
-        else if (a == "--output")         fname_out    = need("--output");
-        else if (a == "--imatrix")        fname_imatrix = need("--imatrix");
-        else if (a == "--include-regex")  include_re   = need("--include-regex");
-        else if (a == "--exclude-regex")  exclude_re   = need("--exclude-regex");
+        if      (a == "--model")            fname_in     = need("--model");
+        else if (a == "--types")            types_csv    = need("--types");
+        else if (a == "--output")           fname_out    = need("--output");
+        else if (a == "--imatrix")          fname_imatrix = need("--imatrix");
+        else if (a == "--include-regex")    include_re   = need("--include-regex");
+        else if (a == "--exclude-regex")    exclude_re   = need("--exclude-regex");
+        else if (a == "--fisher-sidecar")   fisher_sidecar_dir = need("--fisher-sidecar");
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
@@ -281,8 +398,18 @@ int main(int argc, char ** argv) {
 
     FILE * out = fopen(fname_out.c_str(), "w");
     if (!out) { fprintf(stderr, "failed to open output: %s\n", fname_out.c_str()); return 1; }
-    fprintf(out, "tensor_name,n_elements,src_type,fmt,size_bytes,mse,bpw\n");
+    // Schema kept stable across modes: fisher_output_mse is always present;
+    // it's `nan` when no sidecar dir was provided or no sidecar exists for
+    // this tensor. Downstream parsers should treat the column as optional
+    // and tolerate `nan` (and the prismaquant-llama allocator does).
+    fprintf(out, "tensor_name,n_elements,src_type,fmt,size_bytes,mse,bpw,fisher_output_mse\n");
     fflush(out);
+
+    const bool fisher_enabled = !fisher_sidecar_dir.empty();
+    if (fisher_enabled) {
+        fprintf(stderr, "[quantize-cost] fisher sidecar dir: %s\n",
+                fisher_sidecar_dir.c_str());
+    }
 
     // Iterate tensors via the ggml_context that gguf populated.
     int64_t n_total = 0, n_skip = 0, n_done = 0;
@@ -326,6 +453,26 @@ int main(int argc, char ** argv) {
         std::vector<float> src_f32(n_elements);
         src_traits->to_float(raw.data(), src_f32.data(), n_elements);
 
+        // Load fisher sidecar for this tensor, if requested. A missing sidecar
+        // is not fatal — most tensors won't have one (we only emit them for
+        // direct-measure exemplars), and the format-loop will emit `nan` in
+        // the fisher column for any tensor without a loaded sidecar.
+        fisher_sidecar sc;
+        bool have_sidecar = false;
+        if (fisher_enabled) {
+            std::string serr;
+            if (load_fisher_sidecar(fisher_sidecar_dir, name, sc, serr)) {
+                if ((int64_t)sc.in_features != n_per_row) {
+                    fprintf(stderr, "[quantize-cost] WARN: sidecar in_features=%u "
+                            "!= tensor n_per_row=%lld for %s; ignoring sidecar\n",
+                            sc.in_features, (long long)n_per_row, name.c_str());
+                } else {
+                    have_sidecar = true;
+                }
+            }
+            // Silently ignore missing sidecars; warn-spam helps no one.
+        }
+
         for (const auto & tgt : targets) {
             const auto * tgt_traits = ggml_get_type_traits(tgt.t);
             if (!tgt_traits || !tgt_traits->to_float) {
@@ -344,7 +491,7 @@ int main(int argc, char ** argv) {
 
             // Some types require an imatrix; skip cleanly with NaN if so.
             if (ggml_quantize_requires_imatrix(tgt.t) && imatrix_ptr == nullptr) {
-                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0\n",
+                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0,nan\n",
                         name.c_str(), (long long)n_elements,
                         ggml_type_name(src_type), tgt.name);
                 continue;
@@ -357,7 +504,7 @@ int main(int argc, char ** argv) {
             // and abort the whole process.
             const int64_t blck = ggml_blck_size(tgt.t);
             if (blck > 0 && n_per_row % blck != 0) {
-                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0\n",
+                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0,nan\n",
                         name.c_str(), (long long)n_elements,
                         ggml_type_name(src_type), tgt.name);
                 continue;
@@ -395,10 +542,21 @@ int main(int argc, char ** argv) {
             const double mse = sse / (double)n_elements;
             const double bpw = (double)qbytes * 8.0 / (double)n_elements;
 
-            fprintf(out, "%s,%lld,%s,%s,%zu,%.10g,%.6f\n",
+            // Fisher row-weighted output MSE. Only computed when this tensor
+            // has a loaded sidecar — for everything else (no sidecar, kernel
+            // unsupported, etc.), we emit NaN.
+            double fisher_out_mse = std::nan("");
+            if (have_sidecar) {
+                fisher_out_mse = compute_fisher_output_mse(
+                    src_f32.data(), deq_f32.data(),
+                    sc.X.data(), sc.fisher_weights.data(),
+                    n_rows, n_per_row, (int64_t)sc.n_rows);
+            }
+
+            fprintf(out, "%s,%lld,%s,%s,%zu,%.10g,%.6f,%.10g\n",
                     name.c_str(), (long long)n_elements,
                     ggml_type_name(src_type), tgt.name,
-                    qbytes, mse, bpw);
+                    qbytes, mse, bpw, fisher_out_mse);
             fflush(out);
         }
 
