@@ -24,6 +24,8 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <omp.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -192,11 +194,15 @@ static void usage(const char * argv0) {
     fprintf(stderr,
         "Usage: %s --model SRC.gguf --types T1,T2,... --output costs.csv\n"
         "       [--imatrix IMATRIX.dat] [--include-regex REGEX] [--exclude-regex REGEX]\n"
-        "       [--fisher-sidecar DIR]\n"
+        "       [--fisher-sidecar DIR] [--threads N]\n"
         "\n"
         "Writes one row per (tensor, type) measuring round-trip MSE and quantized size.\n"
         "With --fisher-sidecar, additionally computes Fisher row-weighted output MSE\n"
-        "from per-Linear .bin sidecars produced by prismaquant-llama's emitter.\n",
+        "from per-Linear .bin sidecars produced by prismaquant-llama's emitter.\n"
+        "\n"
+        "--threads N parallelizes the per-tensor format loop across N CPU threads\n"
+        "via OpenMP. Defaults to omp_get_max_threads() (all logical cores). Pass a\n"
+        "lower value when running concurrently with other heavy CPU work.\n",
         argv0);
 }
 
@@ -326,6 +332,7 @@ int main(int argc, char ** argv) {
     std::string include_re;
     std::string exclude_re;
     std::string fisher_sidecar_dir;  // optional; activates fisher_output_mse column
+    int n_threads = 0;  // 0 = use omp_get_max_threads()
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -340,9 +347,14 @@ int main(int argc, char ** argv) {
         else if (a == "--include-regex")    include_re   = need("--include-regex");
         else if (a == "--exclude-regex")    exclude_re   = need("--exclude-regex");
         else if (a == "--fisher-sidecar")   fisher_sidecar_dir = need("--fisher-sidecar");
+        else if (a == "--threads")          n_threads    = std::atoi(need("--threads").c_str());
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
+    if (n_threads > 0) {
+        omp_set_num_threads(n_threads);
+    }
+    fprintf(stderr, "[quantize-cost] threads: %d (OpenMP)\n", omp_get_max_threads());
     if (fname_in.empty() || types_csv.empty() || fname_out.empty()) {
         usage(argv[0]); return 1;
     }
@@ -411,6 +423,13 @@ int main(int argc, char ** argv) {
                 fisher_sidecar_dir.c_str());
     }
 
+    // ggml_quantize_init mutates a per-type internal lookup-table cache and is
+    // not safe to call concurrently. Prime it serially for every target before
+    // entering the parallel inner loop below. Idempotent; cheap.
+    for (const auto & tgt : targets) {
+        ggml_quantize_init(tgt.t);
+    }
+
     // Iterate tensors via the ggml_context that gguf populated.
     int64_t n_total = 0, n_skip = 0, n_done = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(meta_ctx); t; t = ggml_get_next_tensor(meta_ctx, t)) {
@@ -473,27 +492,39 @@ int main(int argc, char ** argv) {
             // Silently ignore missing sidecars; warn-spam helps no one.
         }
 
-        for (const auto & tgt : targets) {
+        // Per-target output rows, indexed by position in `targets`. Filled in
+        // parallel; flushed in deterministic order after the parallel region
+        // so output line ordering matches the serial implementation exactly.
+        std::vector<std::string> rows(targets.size());
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int ti = 0; ti < (int)targets.size(); ti++) {
+            const auto & tgt = targets[ti];
             const auto * tgt_traits = ggml_get_type_traits(tgt.t);
             if (!tgt_traits || !tgt_traits->to_float) {
+                #pragma omp critical(qcost_stderr)
                 fprintf(stderr, "[quantize-cost] type has no to_float: %s\n", tgt.name);
                 continue;
             }
             // Look up imatrix vector for this tensor (if loaded). NULL if no
             // imatrix file or if this tensor wasn't in the imatrix; the kernel
             // handles NULL but quality on imatrix-dependent types (IQ_K family)
-            // will be much worse without it.
+            // will be much worse without it. Concurrent const reads of an
+            // unordered_map after load are safe.
             const float * imatrix_ptr = nullptr;
             if (!imatrix_data.empty()) {
                 auto it = imatrix_data.find(name);
                 if (it != imatrix_data.end()) imatrix_ptr = it->second.data();
             }
 
+            char row[2048];
+
             // Some types require an imatrix; skip cleanly with NaN if so.
             if (ggml_quantize_requires_imatrix(tgt.t) && imatrix_ptr == nullptr) {
-                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0,nan\n",
+                snprintf(row, sizeof(row), "%s,%lld,%s,%s,0,nan,0.0,nan\n",
                         name.c_str(), (long long)n_elements,
                         ggml_type_name(src_type), tgt.name);
+                rows[ti] = row;
                 continue;
             }
 
@@ -504,18 +535,21 @@ int main(int argc, char ** argv) {
             // and abort the whole process.
             const int64_t blck = ggml_blck_size(tgt.t);
             if (blck > 0 && n_per_row % blck != 0) {
-                fprintf(out, "%s,%lld,%s,%s,0,nan,0.0,nan\n",
+                snprintf(row, sizeof(row), "%s,%lld,%s,%s,0,nan,0.0,nan\n",
                         name.c_str(), (long long)n_elements,
                         ggml_type_name(src_type), tgt.name);
+                rows[ti] = row;
                 continue;
             }
 
-            // Allocate quantized scratch sized for full tensor.
+            // Per-thread scratch (allocated inside the parallel iteration so
+            // each thread owns its own buffers). ggml_quantize_init was primed
+            // serially before the parallel region — calling it again here would
+            // race the internal lookup-table cache.
             const size_t row_size = ggml_row_size(tgt.t, n_per_row);
             const size_t qbytes = row_size * n_rows;
             std::vector<uint8_t> qbuf(qbytes);
 
-            ggml_quantize_init(tgt.t);
             (void)ggml_quantize_chunk(tgt.t, src_f32.data(), qbuf.data(),
                                       /*start=*/ 0, n_rows, n_per_row,
                                       /*imatrix=*/ imatrix_ptr);
@@ -553,12 +587,17 @@ int main(int argc, char ** argv) {
                     n_rows, n_per_row, (int64_t)sc.n_rows);
             }
 
-            fprintf(out, "%s,%lld,%s,%s,%zu,%.10g,%.6f,%.10g\n",
+            snprintf(row, sizeof(row), "%s,%lld,%s,%s,%zu,%.10g,%.6f,%.10g\n",
                     name.c_str(), (long long)n_elements,
                     ggml_type_name(src_type), tgt.name,
                     qbytes, mse, bpw, fisher_out_mse);
-            fflush(out);
+            rows[ti] = row;
         }
+
+        for (const auto & r : rows) {
+            if (!r.empty()) fputs(r.c_str(), out);
+        }
+        fflush(out);
 
         n_done++;
         if (n_done % 50 == 0) {

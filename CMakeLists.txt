@@ -1,6 +1,8 @@
 set(TARGET llama-quantize-cost)
 add_executable(${TARGET} quantize-cost.cpp)
-target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+
+find_package(OpenMP REQUIRED)
+target_link_libraries(${TARGET} PRIVATE llama-common llama OpenMP::OpenMP_CXX ${CMAKE_THREAD_LIBS_INIT})
 target_include_directories(${TARGET} PRIVATE ../../common)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 

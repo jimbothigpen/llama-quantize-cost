@@ -57,12 +57,14 @@ your/llama.cpp/build/bin/llama-quantize-cost --help
 llama-quantize-cost --model SRC.gguf --types T1,T2,... --output costs.csv
                     [--imatrix IMATRIX.dat]
                     [--include-regex REGEX] [--exclude-regex REGEX]
+                    [--threads N]
 ```
 
 - `--model` — input GGUF (typically a BF16 or F16 reference).
 - `--types` — comma-separated quant names to evaluate. Names that don't resolve against the `ggml` type registry of the build (e.g. recipe-only names like `Q4_K_M`, `IQ3_M`) print a skip-warning and are dropped.
 - `--imatrix` — optional importance matrix file (legacy binary or new GGUF format). Required for `IQ` family types; passed through to `ggml_quantize_chunk` so MSE matches what `llama-quantize` would actually produce.
 - `--include-regex` / `--exclude-regex` — restrict to specific tensors. Useful for the prismaquant-llama exemplar workflow (measure layers 0 and 3 only, propagate to peers).
+- `--threads N` — parallelize the per-tensor format loop across `N` CPU threads via OpenMP. Defaults to `omp_get_max_threads()` (all logical cores). Each tensor's source weights are materialized once and shared across worker threads; per-(tensor,format) work — quantize, dequantize, MSE, optional Fisher output MSE — runs in parallel and rows are emitted in deterministic `--types` order. Lower the value when running concurrently with other heavy CPU work.
 
 Example:
 
